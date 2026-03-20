@@ -3,9 +3,12 @@ package upgrade
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -17,6 +20,12 @@ import (
 
 	"github.com/NVIDIA/k8s-operator-libs/api/upgrade/v1alpha1"
 	"github.com/NVIDIA/k8s-operator-libs/pkg/consts"
+)
+
+const (
+	// driverPodFailingRestartThreshold is the number of container restarts above which a driver pod
+	// is considered to be failing, triggering an upgrade-failed state transition.
+	driverPodFailingRestartThreshold = 10
 )
 
 // CommonUpgradeStateManager interface is a unified cluster upgrade abstraction for both upgrade modes
@@ -97,6 +106,9 @@ type CommonUpgradeManagerImpl struct {
 	// optional states
 	podDeletionStateEnabled bool
 	validationStateEnabled  bool
+
+	// maxConcurrentWorkers limits parallel node processing in state-transition loops.
+	maxConcurrentWorkers int
 }
 
 // NewCommonUpgradeStateManager creates a new instance of CommonUpgradeManagerImpl
@@ -104,7 +116,8 @@ func NewCommonUpgradeStateManager(
 	log logr.Logger,
 	k8sConfig *rest.Config,
 	scheme *runtime.Scheme,
-	eventRecorder record.EventRecorder) (*CommonUpgradeManagerImpl, error) {
+	eventRecorder record.EventRecorder,
+	scale ScaleOptions) (*CommonUpgradeManagerImpl, error) {
 	k8sClient, err := client.New(k8sConfig, client.Options{Scheme: scheme})
 	if err != nil {
 		return &CommonUpgradeManagerImpl{}, fmt.Errorf("error creating k8s client: %v", err)
@@ -115,18 +128,20 @@ func NewCommonUpgradeStateManager(
 		return &CommonUpgradeManagerImpl{}, fmt.Errorf("error creating k8s interface: %v", err)
 	}
 
-	nodeUpgradeStateProvider := NewNodeUpgradeStateProvider(k8sClient, log, eventRecorder)
+	workers := scale.maxConcurrentWorkers()
+	nodeUpgradeStateProvider := NewNodeUpgradeStateProvider(k8sClient, log, eventRecorder, scale)
 	commonUpgrade := CommonUpgradeManagerImpl{
 		Log:                      log,
 		K8sClient:                k8sClient,
 		K8sInterface:             k8sInterface,
 		EventRecorder:            eventRecorder,
-		DrainManager:             NewDrainManager(k8sInterface, nodeUpgradeStateProvider, log, eventRecorder),
-		PodManager:               NewPodManager(k8sInterface, nodeUpgradeStateProvider, log, nil, eventRecorder),
+		DrainManager:             NewDrainManager(k8sInterface, nodeUpgradeStateProvider, log, eventRecorder, workers),
+		PodManager:               NewPodManager(k8sInterface, nodeUpgradeStateProvider, log, nil, eventRecorder, workers),
 		CordonManager:            NewCordonManager(k8sInterface, log),
 		NodeUpgradeStateProvider: nodeUpgradeStateProvider,
 		ValidationManager:        NewValidationManager(k8sInterface, log, eventRecorder, nodeUpgradeStateProvider, ""),
 		SafeDriverLoadManager:    NewSafeDriverLoadManager(nodeUpgradeStateProvider, log),
+		maxConcurrentWorkers:     workers,
 	}
 
 	return &commonUpgrade, nil
@@ -226,68 +241,82 @@ func IsOrphanedPod(pod *corev1.Pod) bool {
 
 // ProcessDoneOrUnknownNodes iterates over UpgradeStateDone or UpgradeStateUnknown nodes and determines
 // whether each specific node should be in UpgradeStateUpgradeRequired or UpgradeStateDone state.
+// Nodes are processed in parallel up to m.maxConcurrentWorkers.
 func (m *CommonUpgradeManagerImpl) ProcessDoneOrUnknownNodes(
 	ctx context.Context, currentClusterState *ClusterUpgradeState, nodeStateName string) error {
 	m.Log.V(consts.LogLevelInfo).Info("ProcessDoneOrUnknownNodes")
 
-	for _, nodeState := range currentClusterState.NodeStates[nodeStateName] {
-		isPodSynced, isOrphaned, err := m.podInSyncWithDS(ctx, nodeState)
-		if err != nil {
-			m.Log.V(consts.LogLevelError).Error(err, "Failed to get daemonset template/pod revision hash")
-			return err
-		}
-		isUpgradeRequested := m.IsUpgradeRequested(nodeState.Node)
-		isWaitingForSafeDriverLoad, err := m.SafeDriverLoadManager.IsWaitingForSafeDriverLoad(ctx, nodeState.Node)
-		if err != nil {
-			m.Log.V(consts.LogLevelError).Error(
-				err, "Failed to check safe driver load status for the node", "node", nodeState.Node.Name)
-			return err
-		}
-		if isWaitingForSafeDriverLoad {
-			m.Log.V(consts.LogLevelInfo).Info("Node is waiting for safe driver load, initialize upgrade",
-				"node", nodeState.Node.Name)
-		}
-		if (!isPodSynced && !isOrphaned) || isWaitingForSafeDriverLoad || isUpgradeRequested {
-			// If node requires upgrade and is Unschedulable, track this in an
-			// annotation and leave node in Unschedulable state when upgrade completes.
-			if IsNodeUnschedulable(nodeState.Node) {
-				annotationKey := GetUpgradeInitialStateAnnotationKey()
-				annotationValue := trueString
-				m.Log.V(consts.LogLevelInfo).Info(
-					"Node is unschedulable, adding annotation to track initial state of the node",
-					"node", nodeState.Node.Name, "annotation", annotationKey)
-				err = m.NodeUpgradeStateProvider.ChangeNodeUpgradeAnnotation(ctx, nodeState.Node, annotationKey,
-					annotationValue)
-				if err != nil {
+	nodes := currentClusterState.NodeStates[nodeStateName]
+	if len(nodes) == 0 {
+		return nil
+	}
+
+	eg, egCtx := errgroup.WithContext(ctx)
+	sem := make(chan struct{}, m.maxConcurrentWorkers)
+
+	for _, nodeState := range nodes {
+		nodeState := nodeState
+		sem <- struct{}{}
+		eg.Go(func() error {
+			defer func() { <-sem }()
+
+			isPodSynced, isOrphaned, err := m.podInSyncWithDS(egCtx, nodeState)
+			if err != nil {
+				m.Log.V(consts.LogLevelError).Error(err, "Failed to get daemonset template/pod revision hash")
+				return err
+			}
+			isUpgradeRequested := m.IsUpgradeRequested(nodeState.Node)
+			isWaitingForSafeDriverLoad, err := m.SafeDriverLoadManager.IsWaitingForSafeDriverLoad(egCtx, nodeState.Node)
+			if err != nil {
+				m.Log.V(consts.LogLevelError).Error(
+					err, "Failed to check safe driver load status for the node", "node", nodeState.Node.Name)
+				return err
+			}
+			if isWaitingForSafeDriverLoad {
+				m.Log.V(consts.LogLevelInfo).Info("Node is waiting for safe driver load, initialize upgrade",
+					"node", nodeState.Node.Name)
+			}
+			if (!isPodSynced && !isOrphaned) || isWaitingForSafeDriverLoad || isUpgradeRequested {
+				// If node requires upgrade and is Unschedulable, track this in an
+				// annotation and leave node in Unschedulable state when upgrade completes.
+				if IsNodeUnschedulable(nodeState.Node) {
+					annotationKey := GetUpgradeInitialStateAnnotationKey()
+					annotationValue := trueString
+					m.Log.V(consts.LogLevelInfo).Info(
+						"Node is unschedulable, adding annotation to track initial state of the node",
+						"node", nodeState.Node.Name, "annotation", annotationKey)
+					if err := m.NodeUpgradeStateProvider.ChangeNodeUpgradeAnnotation(egCtx, nodeState.Node, annotationKey,
+						annotationValue); err != nil {
+						return err
+					}
+				}
+				if err := m.NodeUpgradeStateProvider.ChangeNodeUpgradeState(egCtx, nodeState.Node, UpgradeStateUpgradeRequired); err != nil {
+					m.Log.V(consts.LogLevelError).Error(
+						err, "Failed to change node upgrade state", "state", UpgradeStateUpgradeRequired, "node:", nodeState.Node)
 					return err
 				}
+				m.Log.V(consts.LogLevelInfo).Info("Node requires upgrade, changed its state to UpgradeRequired",
+					"node", nodeState.Node.Name)
+				return nil
 			}
-			err := m.NodeUpgradeStateProvider.ChangeNodeUpgradeState(ctx, nodeState.Node, UpgradeStateUpgradeRequired)
-			if err != nil {
-				m.Log.V(consts.LogLevelError).Error(
-					err, "Failed to change node upgrade state", "state", UpgradeStateUpgradeRequired, "node:", nodeState.Node)
-				return err
-			}
-			m.Log.V(consts.LogLevelInfo).Info("Node requires upgrade, changed its state to UpgradeRequired",
-				"node", nodeState.Node.Name)
-			continue
-		}
 
-		if nodeStateName == UpgradeStateUnknown {
-			err := m.NodeUpgradeStateProvider.ChangeNodeUpgradeState(ctx, nodeState.Node, UpgradeStateDone)
-			if err != nil {
-				m.Log.V(consts.LogLevelError).Error(
-					err, "Failed to change node upgrade state", "state", UpgradeStateDone)
-				return err
+			if nodeStateName == UpgradeStateUnknown {
+				if err := m.NodeUpgradeStateProvider.ChangeNodeUpgradeState(egCtx, nodeState.Node, UpgradeStateDone); err != nil {
+					m.Log.V(consts.LogLevelError).Error(
+						err, "Failed to change node upgrade state", "state", UpgradeStateDone)
+					return err
+				}
+				m.Log.V(consts.LogLevelInfo).Info("Changed node state to UpgradeDone",
+					"node", nodeState.Node.Name)
+				return nil
 			}
-			m.Log.V(consts.LogLevelInfo).Info("Changed node state to UpgradeDone",
+			m.Log.V(consts.LogLevelDebug).Info("Node in UpgradeDone state, upgrade not required",
 				"node", nodeState.Node.Name)
-			continue
-		}
-		m.Log.V(consts.LogLevelDebug).Info("Node in UpgradeDone state, upgrade not required",
-			"node", nodeState.Node.Name)
+			return nil
+		})
 	}
-	return nil
+
+	return eg.Wait()
 }
 
 // podInSyncWithDS check if pod is in sync with DaemonSet, handling also Orphaned Pod
@@ -357,26 +386,40 @@ func (m *CommonUpgradeManagerImpl) ProcessDrainNodes(
 }
 
 // ProcessCordonRequiredNodes processes UpgradeStateCordonRequired nodes,
-// cordons them and moves them to UpgradeStateWaitForJobsRequired state
+// cordons them and moves them to UpgradeStateWaitForJobsRequired state.
+// Nodes are processed in parallel up to m.maxConcurrentWorkers.
 func (m *CommonUpgradeManagerImpl) ProcessCordonRequiredNodes(
 	ctx context.Context, currentClusterState *ClusterUpgradeState) error {
 	m.Log.V(consts.LogLevelInfo).Info("ProcessCordonRequiredNodes")
 
-	for _, nodeState := range currentClusterState.NodeStates[UpgradeStateCordonRequired] {
-		err := m.CordonManager.Cordon(ctx, nodeState.Node)
-		if err != nil {
-			m.Log.V(consts.LogLevelWarning).Error(
-				err, "Node cordon failed", "node", nodeState.Node)
-			return err
-		}
-		err = m.NodeUpgradeStateProvider.ChangeNodeUpgradeState(ctx, nodeState.Node, UpgradeStateWaitForJobsRequired)
-		if err != nil {
-			m.Log.V(consts.LogLevelError).Error(
-				err, "Failed to change node upgrade state", "state", UpgradeStateWaitForJobsRequired)
-			return err
-		}
+	nodes := currentClusterState.NodeStates[UpgradeStateCordonRequired]
+	if len(nodes) == 0 {
+		return nil
 	}
-	return nil
+
+	eg, egCtx := errgroup.WithContext(ctx)
+	sem := make(chan struct{}, m.maxConcurrentWorkers)
+
+	for _, nodeState := range nodes {
+		nodeState := nodeState
+		sem <- struct{}{}
+		eg.Go(func() error {
+			defer func() { <-sem }()
+
+			if err := m.CordonManager.Cordon(egCtx, nodeState.Node); err != nil {
+				m.Log.V(consts.LogLevelWarning).Error(err, "Node cordon failed", "node", nodeState.Node)
+				return err
+			}
+			if err := m.NodeUpgradeStateProvider.ChangeNodeUpgradeState(egCtx, nodeState.Node, UpgradeStateWaitForJobsRequired); err != nil {
+				m.Log.V(consts.LogLevelError).Error(
+					err, "Failed to change node upgrade state", "state", UpgradeStateWaitForJobsRequired)
+				return err
+			}
+			return nil
+		})
+	}
+
+	return eg.Wait()
 }
 
 // ProcessWaitForJobsRequiredNodes processes UpgradeStateWaitForJobsRequired nodes,
@@ -396,7 +439,13 @@ func (m *CommonUpgradeManagerImpl) ProcessWaitForJobsRequiredNodes(
 			if !m.IsPodDeletionEnabled() {
 				nextState = UpgradeStateDrainRequired
 			}
-			_ = m.NodeUpgradeStateProvider.ChangeNodeUpgradeState(ctx, nodeState.Node, nextState)
+			if err := m.NodeUpgradeStateProvider.ChangeNodeUpgradeState(ctx, nodeState.Node, nextState); err != nil {
+				m.Log.V(consts.LogLevelError).Error(err, "Failed to change node upgrade state",
+					"node", nodeState.Node.Name, "state", nextState)
+				logEventf(m.EventRecorder, nodeState.Node, corev1.EventTypeWarning, GetEventReason(),
+					"Failed to update node state to %s: %s", nextState, err.Error())
+				return err
+			}
 			m.Log.V(consts.LogLevelInfo).Info("Updated the node state", "node", nodeState.Node.Name, "state", nextState)
 		}
 	}
@@ -429,7 +478,13 @@ func (m *CommonUpgradeManagerImpl) ProcessPodDeletionRequiredNodes(
 	if !m.IsPodDeletionEnabled() {
 		m.Log.V(consts.LogLevelInfo).Info("PodDeletion is not enabled, proceeding straight to the next state")
 		for _, nodeState := range currentClusterState.NodeStates[UpgradeStatePodDeletionRequired] {
-			_ = m.NodeUpgradeStateProvider.ChangeNodeUpgradeState(ctx, nodeState.Node, UpgradeStateDrainRequired)
+			if err := m.NodeUpgradeStateProvider.ChangeNodeUpgradeState(ctx, nodeState.Node, UpgradeStateDrainRequired); err != nil {
+				m.Log.V(consts.LogLevelError).Error(err, "Failed to change node upgrade state",
+					"node", nodeState.Node.Name, "state", UpgradeStateDrainRequired)
+				logEventf(m.EventRecorder, nodeState.Node, corev1.EventTypeWarning, GetEventReason(),
+					"Failed to update node state to %s: %s", UpgradeStateDrainRequired, err.Error())
+				return err
+			}
 		}
 		return nil
 	}
@@ -562,6 +617,7 @@ func (m *CommonUpgradeManagerImpl) ProcessUpgradeFailedNodes(
 				if err != nil {
 					return err
 				}
+				m.removeUpgradeDeadlineAnnotation(ctx, nodeState.Node)
 			}
 		}
 	}
@@ -635,12 +691,12 @@ func (m *CommonUpgradeManagerImpl) isDriverPodInSync(ctx context.Context,
 
 func (m *CommonUpgradeManagerImpl) isDriverPodFailing(pod *corev1.Pod) bool {
 	for _, status := range pod.Status.InitContainerStatuses {
-		if !status.Ready && status.RestartCount > 10 {
+		if !status.Ready && status.RestartCount > driverPodFailingRestartThreshold {
 			return true
 		}
 	}
 	for _, status := range pod.Status.ContainerStatuses {
-		if !status.Ready && status.RestartCount > 10 {
+		if !status.Ready && status.RestartCount > driverPodFailingRestartThreshold {
 			return true
 		}
 	}
@@ -703,12 +759,45 @@ func (m *CommonUpgradeManagerImpl) updateNodeToUncordonOrDoneState(ctx context.C
 		if err != nil {
 			return err
 		}
+		m.removeUpgradeDeadlineAnnotation(ctx, node)
 	}
 	return nil
 }
 
 func IsNodeUnschedulable(node *corev1.Node) bool {
 	return node.Spec.Unschedulable
+}
+
+// checkOrSetUpgradeDeadline manages the per-node upgrade deadline annotation.
+// On the first call for a node it sets a deadline annotation equal to now + timeoutSeconds and returns false.
+// On subsequent calls it returns true if the current time has passed the deadline, false otherwise.
+func (m *CommonUpgradeManagerImpl) checkOrSetUpgradeDeadline(
+	ctx context.Context, node *corev1.Node, timeoutSeconds int) (bool, error) {
+	annotationKey := GetUpgradeNodeDeadlineAnnotationKey()
+	currentTime := time.Now().Unix()
+	if _, present := node.Annotations[annotationKey]; !present {
+		deadline := strconv.FormatInt(currentTime+int64(timeoutSeconds), 10)
+		m.Log.V(consts.LogLevelInfo).Info("Setting upgrade deadline annotation",
+			"node", node.Name, "deadlineUnix", deadline, "timeoutSeconds", timeoutSeconds)
+		return false, m.NodeUpgradeStateProvider.ChangeNodeUpgradeAnnotation(ctx, node, annotationKey, deadline)
+	}
+	deadline, err := strconv.ParseInt(node.Annotations[annotationKey], 10, 64)
+	if err != nil {
+		return false, fmt.Errorf("failed to parse upgrade deadline annotation on node %s: %w", node.Name, err)
+	}
+	return currentTime > deadline, nil
+}
+
+// removeUpgradeDeadlineAnnotation removes the upgrade deadline annotation from the node.
+// Called when a node reaches a terminal upgrade state (done or failed).
+func (m *CommonUpgradeManagerImpl) removeUpgradeDeadlineAnnotation(ctx context.Context, node *corev1.Node) {
+	annotationKey := GetUpgradeNodeDeadlineAnnotationKey()
+	if _, present := node.Annotations[annotationKey]; !present {
+		return
+	}
+	if err := m.NodeUpgradeStateProvider.ChangeNodeUpgradeAnnotation(ctx, node, annotationKey, nullString); err != nil {
+		m.Log.V(consts.LogLevelError).Error(err, "Failed to remove upgrade deadline annotation", "node", node.Name)
+	}
 }
 
 // GetTotalManagedNodes returns the total count of nodes managed for driver upgrades

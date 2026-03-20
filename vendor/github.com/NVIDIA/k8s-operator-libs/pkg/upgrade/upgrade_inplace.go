@@ -19,6 +19,7 @@ package upgrade
 import (
 	"context"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"github.com/NVIDIA/k8s-operator-libs/api/upgrade/v1alpha1"
@@ -82,6 +83,27 @@ func (m *InplaceNodeStateManagerImpl) ProcessUpgradeRequiredNodes(
 		if m.SkipNodeUpgrade(nodeState.Node) {
 			m.Log.V(consts.LogLevelInfo).Info("Node is marked for skipping upgrades", "node", nodeState.Node.Name)
 			continue
+		}
+
+		if upgradePolicy.NodeUpgradeTimeoutSeconds > 0 {
+			exceeded, err := m.checkOrSetUpgradeDeadline(ctx, nodeState.Node, upgradePolicy.NodeUpgradeTimeoutSeconds)
+			if err != nil {
+				m.Log.V(consts.LogLevelError).Error(err, "Failed to check upgrade deadline", "node", nodeState.Node.Name)
+				return err
+			}
+			if exceeded {
+				m.Log.V(consts.LogLevelWarning).Info("Node upgrade deadline exceeded, marking as failed",
+					"node", nodeState.Node.Name)
+				logEventf(m.EventRecorder, nodeState.Node, corev1.EventTypeWarning, GetEventReason(),
+					"Node upgrade deadline exceeded after %d seconds, marking node as upgrade-failed",
+					upgradePolicy.NodeUpgradeTimeoutSeconds)
+				if err := m.NodeUpgradeStateProvider.ChangeNodeUpgradeState(ctx, nodeState.Node, UpgradeStateFailed); err != nil {
+					m.Log.V(consts.LogLevelError).Error(err, "Failed to move timed-out node to failed state",
+						"node", nodeState.Node.Name)
+					return err
+				}
+				continue
+			}
 		}
 
 		if upgradesAvailable <= 0 {

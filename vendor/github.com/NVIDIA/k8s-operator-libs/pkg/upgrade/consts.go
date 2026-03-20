@@ -45,6 +45,10 @@ const (
 	// UpgradeRequestorModeAnnotationKeyFmt is the format of the node annotation indicating requestor driver upgrade
 	// mode is used for underlying node
 	UpgradeRequestorModeAnnotationKeyFmt = "nvidia.com/%s-driver-upgrade-requestor-mode"
+	// UpgradeNodeDeadlineAnnotationKeyFmt is the format of the node annotation storing the Unix timestamp (seconds)
+	// by which the full upgrade sequence for the node must complete. Set when the node first enters
+	// upgrade-required; removed when the node reaches upgrade-done or upgrade-failed.
+	UpgradeNodeDeadlineAnnotationKeyFmt = "nvidia.com/%s-driver-upgrade-deadline"
 	// UpgradeStateUnknown Node has this state when the upgrade flow is disabled or the node hasn't been processed yet
 	UpgradeStateUnknown = ""
 	// UpgradeStateUpgradeRequired is set when the driver pod on the node is not up-to-date and required upgrade
@@ -90,4 +94,13 @@ const (
 	nullString = "null"
 	// trueString is the word true as string to avoid duplication and linting errors
 	trueString = "true"
+
+	// defaultMaxConcurrentNodeWorkers is the default number of nodes processed concurrently during
+	// upgrade state transitions. Increasing this reduces upgrade time on large clusters.
+	defaultMaxConcurrentNodeWorkers = 32
+	// defaultCacheSyncTimeout is the default maximum time to wait for the controller cache to reflect
+	// a node label/annotation patch before continuing. Reduced from 10s to minimize reconcile blocking.
+	defaultCacheSyncTimeout = 500 * 1000 * 1000 // 500ms in nanoseconds (time.Duration)
+	// cacheSyncPollInterval is the interval between cache-sync check iterations.
+	cacheSyncPollInterval = 100 * 1000 * 1000 // 100ms in nanoseconds (time.Duration)
 )

@@ -42,6 +42,7 @@ type DrainManagerImpl struct {
 	nodeUpgradeStateProvider NodeUpgradeStateProvider
 	log                      logr.Logger
 	eventRecorder            record.EventRecorder
+	maxConcurrentWorkers     int
 }
 
 // DrainManager is an interface that allows to schedule nodes drain based on DrainSpec
@@ -101,7 +102,7 @@ func (m *DrainManagerImpl) ScheduleNodesDrain(ctx context.Context, drainConfig *
 		// If a loop variable is used as it is, all/most goroutines, spawned inside this loop,
 		// will use the 'node' value of the last item in drainConfig.Nodes
 		node := node
-		if !m.drainingNodes.Has(node.Name) {
+		if !m.drainingNodes.Has(node.Name) && m.drainingNodes.Len() < m.maxConcurrentWorkers {
 			m.log.V(consts.LogLevelInfo).Info("Schedule drain for node", "node", node.Name)
 			logEvent(m.eventRecorder, node, corev1.EventTypeNormal, GetEventReason(), "Scheduling drain of the node")
 
@@ -131,6 +132,9 @@ func (m *DrainManagerImpl) ScheduleNodesDrain(ctx context.Context, drainConfig *
 
 				_ = m.nodeUpgradeStateProvider.ChangeNodeUpgradeState(ctx, node, UpgradeStatePodRestartRequired)
 			}()
+		} else if m.drainingNodes.Len() >= m.maxConcurrentWorkers {
+			m.log.V(consts.LogLevelInfo).Info("Max concurrent drain limit reached, deferring node", "node", node.Name,
+				"limit", m.maxConcurrentWorkers)
 		} else {
 			m.log.V(consts.LogLevelInfo).Info("Node is already being drained, skipping", "node", node.Name)
 		}
@@ -143,13 +147,15 @@ func NewDrainManager(
 	k8sInterface kubernetes.Interface,
 	nodeUpgradeStateProvider NodeUpgradeStateProvider,
 	log logr.Logger,
-	eventRecorder record.EventRecorder) *DrainManagerImpl {
+	eventRecorder record.EventRecorder,
+	maxConcurrentWorkers int) *DrainManagerImpl {
 	mgr := &DrainManagerImpl{
 		k8sInterface:             k8sInterface,
 		log:                      log,
 		drainingNodes:            NewStringSet(),
 		nodeUpgradeStateProvider: nodeUpgradeStateProvider,
 		eventRecorder:            eventRecorder,
+		maxConcurrentWorkers:     maxConcurrentWorkers,
 	}
 
 	return mgr

@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
+	upgrade_v1alpha1 "github.com/NVIDIA/k8s-operator-libs/api/upgrade/v1alpha1"
 	"github.com/NVIDIA/k8s-operator-libs/pkg/consts"
 	"github.com/NVIDIA/k8s-operator-libs/pkg/upgrade"
 	"github.com/go-logr/logr"
@@ -165,30 +166,33 @@ func (r *UpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
-	// We want to skip operator itself during the drain because the upgrade process might hang
-	// if the operator is evicted and can't be rescheduled to any other node, e.g. in a single-node cluster.
-	// It's safe to do because the goal of the node draining during the upgrade is to
-	// evict pods that might use driver and operator doesn't use in its own pod.
-	if clusterPolicy.Spec.Driver.UpgradePolicy.DrainSpec.PodSelector == "" {
-		clusterPolicy.Spec.Driver.UpgradePolicy.DrainSpec.PodSelector = UpgradeSkipDrainLabelSelector
+	// Build a deep copy of the upgrade policy so we can safely inject the operator self-protection
+	// drain selector without mutating the in-memory ClusterPolicy object. This prevents selector
+	// duplication across reconcile iterations and nil-pointer panics when DrainSpec is absent.
+	upgradePolicy := clusterPolicy.Spec.Driver.UpgradePolicy.DeepCopy()
+	skipSelector := UpgradeSkipDrainLabelSelector
+	if upgradePolicy.DrainSpec == nil {
+		upgradePolicy.DrainSpec = &upgrade_v1alpha1.DrainSpec{PodSelector: skipSelector}
+	} else if upgradePolicy.DrainSpec.PodSelector == "" {
+		upgradePolicy.DrainSpec.PodSelector = skipSelector
 	} else {
-		clusterPolicy.Spec.Driver.UpgradePolicy.DrainSpec.PodSelector =
-			fmt.Sprintf("%s,%s", clusterPolicy.Spec.Driver.UpgradePolicy.DrainSpec.PodSelector, UpgradeSkipDrainLabelSelector)
+		upgradePolicy.DrainSpec.PodSelector =
+			fmt.Sprintf("%s,%s", upgradePolicy.DrainSpec.PodSelector, skipSelector)
 	}
 
-	// log metrics with the current state
-	if clusterPolicyCtrl.operatorMetrics != nil {
-		clusterPolicyCtrl.operatorMetrics.upgradesInProgress.Set(float64(r.StateManager.GetUpgradesInProgress(state)))
-		clusterPolicyCtrl.operatorMetrics.upgradesDone.Set(float64(r.StateManager.GetUpgradesDone(state)))
-		clusterPolicyCtrl.operatorMetrics.upgradesAvailable.Set(float64(r.StateManager.GetUpgradesAvailable(state, clusterPolicy.Spec.Driver.UpgradePolicy.MaxParallelUpgrades, maxUnavailable)))
-		clusterPolicyCtrl.operatorMetrics.upgradesFailed.Set(float64(r.StateManager.GetUpgradesFailed(state)))
-		clusterPolicyCtrl.operatorMetrics.upgradesPending.Set(float64(r.StateManager.GetUpgradesPending(state)))
-	}
-
-	err = r.StateManager.ApplyState(ctx, state, clusterPolicy.Spec.Driver.UpgradePolicy)
+	err = r.StateManager.ApplyState(ctx, state, upgradePolicy)
 	if err != nil {
 		r.Log.Error(err, "Failed to apply cluster upgrade state")
 		return ctrl.Result{}, err
+	}
+
+	// Update metrics after ApplyState succeeds so they reflect the state that was actually applied.
+	if clusterPolicyCtrl.operatorMetrics != nil {
+		clusterPolicyCtrl.operatorMetrics.upgradesInProgress.Set(float64(r.StateManager.GetUpgradesInProgress(state)))
+		clusterPolicyCtrl.operatorMetrics.upgradesDone.Set(float64(r.StateManager.GetUpgradesDone(state)))
+		clusterPolicyCtrl.operatorMetrics.upgradesAvailable.Set(float64(r.StateManager.GetUpgradesAvailable(state, upgradePolicy.MaxParallelUpgrades, maxUnavailable)))
+		clusterPolicyCtrl.operatorMetrics.upgradesFailed.Set(float64(r.StateManager.GetUpgradesFailed(state)))
+		clusterPolicyCtrl.operatorMetrics.upgradesPending.Set(float64(r.StateManager.GetUpgradesPending(state)))
 	}
 
 	// In some cases if node state changes fail to apply, upgrade process
