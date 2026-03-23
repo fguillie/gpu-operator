@@ -16,7 +16,7 @@ PUSH_ON_BUILD ?= false
 ATTACH_ATTESTATIONS ?= false
 DOCKER_BUILD_PLATFORM_OPTIONS ?= --platform=linux/amd64
 ifeq ($(DOCKER),podman)
-DOCKER_BUILD_OPTIONS = --output=type=image,push=$(PUSH_ON_BUILD)
+DOCKER_BUILD_OPTIONS =
 else
 DOCKER_BUILD_OPTIONS = --output=type=image,push=$(PUSH_ON_BUILD) --provenance=$(ATTACH_ATTESTATIONS) --sbom=$(ATTACH_ATTESTATIONS)
 endif
