@@ -43,6 +43,20 @@ Note:
 To deploy the GPU Operator on OpenShift, follow the instructions in the [official documentation](https://docs.nvidia.com/datacenter/cloud-native/openshift/latest/steps-overview.html).
 
 
+## Building the Container Image
+
+To build the GPU Operator container image locally, use `make build-image`. By default the build uses `docker`. To use **Podman** instead, override the `DOCKER` variable:
+
+```bash
+make build-image DOCKER=podman
+```
+
+You can also set a custom image name and tag:
+
+```bash
+make build-image DOCKER=podman IMAGE=myregistry/gpu-operator TAG=latest
+```
+
 ## Product Documentation
 For information on platform support and getting started, visit the official documentation [repository](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/overview.html).
 
