@@ -38,20 +38,24 @@ type NodeUpgradeStateProvider interface {
 
 // NodeUpgradeStateProviderImpl implements the NodeUpgradeStateProvider interface
 type NodeUpgradeStateProviderImpl struct {
-	K8sClient     client.Client
-	Log           logr.Logger
-	nodeMutex     KeyedMutex
-	eventRecorder record.EventRecorder
+	K8sClient             client.Client
+	Log                   logr.Logger
+	nodeMutex             KeyedMutex
+	eventRecorder         record.EventRecorder
+	cacheSyncTimeout      time.Duration
+	cacheSyncPollInterval time.Duration
 }
 
 // NewNodeUpgradeStateProvider creates a NodeUpgradeStateProviderImpl
 func NewNodeUpgradeStateProvider(k8sClient client.Client, log logr.Logger,
-	eventRecorder record.EventRecorder) NodeUpgradeStateProvider {
+	eventRecorder record.EventRecorder, scale ScaleOptions) NodeUpgradeStateProvider {
 	return &NodeUpgradeStateProviderImpl{
-		K8sClient:     k8sClient,
-		Log:           log,
-		nodeMutex:     KeyedMutex{},
-		eventRecorder: eventRecorder,
+		K8sClient:             k8sClient,
+		Log:                   log,
+		nodeMutex:             KeyedMutex{},
+		eventRecorder:         eventRecorder,
+		cacheSyncTimeout:      scale.effectiveCacheSyncTimeout(),
+		cacheSyncPollInterval: scale.effectiveCacheSyncPollInterval(),
 	}
 }
 
@@ -97,14 +101,12 @@ func (p *NodeUpgradeStateProviderImpl) ChangeNodeUpgradeState(
 	// so we wait until it's synced.
 	// That way, since only one call to reconcile at a time is allowed for upgrade controller, each new update
 	// will have the updated node object in the cache.
-	timeoutCtx, cancel := context.WithTimeout(ctx, time.Second*10)
+	timeoutCtx, cancel := context.WithTimeout(ctx, p.cacheSyncTimeout)
 	defer cancel()
-	//nolint:staticcheck
-	err = wait.PollImmediateUntil(time.Second, func() (bool, error) {
+	err = wait.PollUntilContextTimeout(timeoutCtx, p.cacheSyncPollInterval, p.cacheSyncTimeout, true, func(ctx context.Context) (bool, error) {
 		p.Log.V(consts.LogLevelDebug).Info("Requesting node object to see if operator cache has updated",
 			"node", node.Name)
-		err := p.K8sClient.Get(timeoutCtx, types.NamespacedName{Name: node.Name}, node)
-		if err != nil {
+		if err := p.K8sClient.Get(ctx, types.NamespacedName{Name: node.Name}, node); err != nil {
 			return false, err
 		}
 		nodeState := node.Labels[GetUpgradeStateLabelKey()]
@@ -114,7 +116,7 @@ func (p *NodeUpgradeStateProviderImpl) ChangeNodeUpgradeState(
 			return false, nil
 		}
 		return true, nil
-	}, timeoutCtx.Done())
+	})
 
 	if err != nil {
 		p.Log.V(consts.LogLevelError).Error(err, "Error while waiting on node label update",
@@ -168,14 +170,12 @@ func (p *NodeUpgradeStateProviderImpl) ChangeNodeUpgradeAnnotation(
 	// so we wait until it's synced.
 	// That way, since only one call to reconcile at a time is allowed for upgrade controller, each new update
 	// will have the updated node object in the cache.
-	timeoutCtx, cancel := context.WithTimeout(ctx, time.Second*10)
+	timeoutCtx, cancel := context.WithTimeout(ctx, p.cacheSyncTimeout)
 	defer cancel()
-	//nolint:staticcheck
-	err = wait.PollImmediateUntil(time.Second, func() (bool, error) {
+	err = wait.PollUntilContextTimeout(timeoutCtx, p.cacheSyncPollInterval, p.cacheSyncTimeout, true, func(ctx context.Context) (bool, error) {
 		p.Log.V(consts.LogLevelDebug).Info("Requesting node object to see if operator cache has updated",
 			"node", node.Name)
-		err := p.K8sClient.Get(timeoutCtx, types.NamespacedName{Name: node.Name}, node)
-		if err != nil {
+		if err := p.K8sClient.Get(ctx, types.NamespacedName{Name: node.Name}, node); err != nil {
 			return false, err
 		}
 		annotationValue, exists := node.Annotations[key]
@@ -194,7 +194,7 @@ func (p *NodeUpgradeStateProviderImpl) ChangeNodeUpgradeAnnotation(
 			return false, nil
 		}
 		return true, nil
-	}, timeoutCtx.Done())
+	})
 
 	if err != nil {
 		p.Log.V(consts.LogLevelError).Error(err, "Error while waiting on node annotation update",

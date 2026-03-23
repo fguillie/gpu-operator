@@ -18,6 +18,7 @@ package upgrade
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -47,6 +48,7 @@ type PodManagerImpl struct {
 	nodesInProgress          *StringSet
 	log                      logr.Logger
 	eventRecorder            record.EventRecorder
+	maxConcurrentWorkers     int
 }
 
 // PodManager is an interface that allows to wait on certain pod statuses
@@ -157,7 +159,7 @@ func (m *PodManagerImpl) SchedulePodEviction(ctx context.Context, config *PodMan
 	}
 
 	for _, node := range config.Nodes {
-		if !m.nodesInProgress.Has(node.Name) {
+		if !m.nodesInProgress.Has(node.Name) && m.nodesInProgress.Len() < m.maxConcurrentWorkers {
 			m.log.V(consts.LogLevelInfo).Info("Deleting pods on node", "node", node.Name)
 			m.nodesInProgress.Add(node.Name)
 
@@ -183,7 +185,12 @@ func (m *PodManagerImpl) SchedulePodEviction(ctx context.Context, config *PodMan
 
 				if numPodsToDelete == 0 {
 					m.log.V(consts.LogLevelInfo).Info("No pods require deletion", "node", node.Name)
-					_ = m.nodeUpgradeStateProvider.ChangeNodeUpgradeState(ctx, &node, UpgradeStatePodRestartRequired)
+					if err := m.nodeUpgradeStateProvider.ChangeNodeUpgradeState(ctx, &node, UpgradeStatePodRestartRequired); err != nil {
+						m.log.V(consts.LogLevelError).Error(err, "Failed to change node upgrade state",
+							"node", node.Name, "state", UpgradeStatePodRestartRequired)
+						logEventf(m.eventRecorder, &node, corev1.EventTypeWarning, GetEventReason(),
+							"Failed to update node state to %s: %s", UpgradeStatePodRestartRequired, err.Error())
+					}
 					return
 				}
 
@@ -217,10 +224,18 @@ func (m *PodManagerImpl) SchedulePodEviction(ctx context.Context, config *PodMan
 				}
 
 				m.log.V(consts.LogLevelInfo).Info("Deleted pods on the node", "node", node.Name)
-				_ = m.nodeUpgradeStateProvider.ChangeNodeUpgradeState(ctx, &node, UpgradeStatePodRestartRequired)
+				if err := m.nodeUpgradeStateProvider.ChangeNodeUpgradeState(ctx, &node, UpgradeStatePodRestartRequired); err != nil {
+					m.log.V(consts.LogLevelError).Error(err, "Failed to change node upgrade state",
+						"node", node.Name, "state", UpgradeStatePodRestartRequired)
+					logEventf(m.eventRecorder, &node, corev1.EventTypeWarning, GetEventReason(),
+						"Failed to update node state to %s: %s", UpgradeStatePodRestartRequired, err.Error())
+				}
 				logEvent(m.eventRecorder, &node, corev1.EventTypeNormal, GetEventReason(),
 					"Deleted workload pods on the node for the driver upgrade")
 			}(*node)
+		} else if m.nodesInProgress.Len() >= m.maxConcurrentWorkers {
+			m.log.V(consts.LogLevelInfo).Info("Max concurrent eviction limit reached, deferring node", "node", node.Name,
+				"limit", m.maxConcurrentWorkers)
 		} else {
 			m.log.V(consts.LogLevelInfo).Info("Node is already getting pods deleted, skipping", "node", node.Name)
 		}
@@ -236,18 +251,17 @@ func (m *PodManagerImpl) SchedulePodsRestart(ctx context.Context, pods []*corev1
 		m.log.V(consts.LogLevelInfo).Info("No pods scheduled to restart")
 		return nil
 	}
+	var errs []error
 	for _, pod := range pods {
 		m.log.V(consts.LogLevelInfo).Info("Deleting pod", "pod", pod.Name)
-		deleteOptions := meta_v1.DeleteOptions{}
-		err := m.k8sInterface.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, deleteOptions)
-		if err != nil {
+		if err := m.k8sInterface.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, meta_v1.DeleteOptions{}); err != nil {
 			m.log.V(consts.LogLevelInfo).Error(err, "Failed to delete pod", "pod", pod.Name)
 			logEventf(m.eventRecorder, pod, corev1.EventTypeWarning, GetEventReason(),
 				"Failed to restart driver pod %s", err.Error())
-			return err
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // ScheduleCheckOnPodCompletion receives PodSelectorConfig and schedules checks for pod statuses on each node in the
@@ -306,7 +320,11 @@ func (m *PodManagerImpl) ScheduleCheckOnPodCompletion(ctx context.Context, confi
 				return
 			}
 			// update node state
-			_ = m.nodeUpgradeStateProvider.ChangeNodeUpgradeState(ctx, &node, UpgradeStatePodDeletionRequired)
+			if err := m.nodeUpgradeStateProvider.ChangeNodeUpgradeState(ctx, &node, UpgradeStatePodDeletionRequired); err != nil {
+				logEventf(m.eventRecorder, &node, corev1.EventTypeWarning, GetEventReason(),
+					"Failed to update node state to %s: %s", UpgradeStatePodDeletionRequired, err.Error())
+				return
+			}
 			m.log.V(consts.LogLevelInfo).Info("Updated the node state", "node", node.Name,
 				"state", UpgradeStatePodDeletionRequired)
 		}(*node)
@@ -408,7 +426,8 @@ func NewPodManager(
 	nodeUpgradeStateProvider NodeUpgradeStateProvider,
 	log logr.Logger,
 	podDeletionFilter PodDeletionFilter,
-	eventRecorder record.EventRecorder) *PodManagerImpl {
+	eventRecorder record.EventRecorder,
+	maxConcurrentWorkers int) *PodManagerImpl {
 	mgr := &PodManagerImpl{
 		k8sInterface:             k8sInterface,
 		log:                      log,
@@ -416,6 +435,7 @@ func NewPodManager(
 		podDeletionFilter:        podDeletionFilter,
 		nodesInProgress:          NewStringSet(),
 		eventRecorder:            eventRecorder,
+		maxConcurrentWorkers:     maxConcurrentWorkers,
 	}
 
 	return mgr

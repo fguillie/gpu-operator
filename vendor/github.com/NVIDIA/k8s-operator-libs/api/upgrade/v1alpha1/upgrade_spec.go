@@ -46,6 +46,14 @@ type DriverUpgradePolicySpec struct {
 	PodDeletion       *PodDeletionSpec       `json:"podDeletion,omitempty"`
 	WaitForCompletion *WaitForCompletionSpec `json:"waitForCompletion,omitempty"`
 	DrainSpec         *DrainSpec             `json:"drain,omitempty"`
+	// NodeUpgradeTimeoutSeconds is the maximum time in seconds allowed for the entire upgrade
+	// sequence on a single node. The timer starts when the node first enters the upgrade-required
+	// state. If the node has not reached upgrade-done within this window it is transitioned to
+	// upgrade-failed. Zero means no timeout (default).
+	// +optional
+	// +kubebuilder:default:=0
+	// +kubebuilder:validation:Minimum:=0
+	NodeUpgradeTimeoutSeconds int `json:"nodeUpgradeTimeoutSeconds,omitempty"`
 }
 
 // WaitForCompletionSpec describes the configuration for waiting on job completions

@@ -75,6 +75,8 @@ func main() {
 	var enableLeaderElection bool
 	var probeAddr string
 	var renewDeadline time.Duration
+	var apiQPS float64
+	var apiBurst int
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -86,6 +88,8 @@ func main() {
 			"Only enabled when the --leader-elect flag is set. "+
 			"If undefined, the renew deadline defaults to the controller-runtime manager's default RenewDeadline. "+
 			"By setting this option, the LeaseDuration is also set as RenewDealine + 5s.")
+	flag.Float64Var(&apiQPS, "api-qps", 100, "Maximum QPS to the Kubernetes API server from the upgrade controller.")
+	flag.IntVar(&apiBurst, "api-burst", 200, "Maximum burst for throttle to the Kubernetes API server from the upgrade controller.")
 
 	opts := zap.Options{
 		StacktraceLevel: zapcore.PanicLevel,
@@ -162,9 +166,17 @@ func main() {
 	// setup upgrade controller
 	upgrade.SetDriverName("gpu")
 	upgradeLogger := ctrl.Log.WithName("controllers").WithName("Upgrade")
+
+	// Build a copy of the rest.Config with operator-tuned rate limits for the upgrade controller.
+	// The manager's shared client uses the controller-runtime defaults (QPS=20, burst=30), which
+	// can bottleneck on large clusters. The upgrade controller's own k8s client gets higher limits.
+	upgradeRestConfig := *mgr.GetConfig()
+	upgradeRestConfig.QPS = float32(apiQPS)
+	upgradeRestConfig.Burst = apiBurst
+
 	clusterUpgradeStateManager, err := upgrade.NewClusterUpgradeStateManager(
 		upgradeLogger,
-		mgr.GetConfig(),
+		&upgradeRestConfig,
 		// nolint:staticcheck
 		// TODO: update k8s-operator-libs to leverage events.EventRecorder instead
 		mgr.GetEventRecorderFor("nvidia-gpu-operator"),

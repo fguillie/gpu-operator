@@ -19,6 +19,7 @@ package upgrade
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -67,7 +68,7 @@ func NewClusterUpgradeStateManager(
 	k8sConfig *rest.Config,
 	eventRecorder record.EventRecorder,
 	opts StateOptions) (ClusterUpgradeStateManager, error) {
-	commonmanager, err := NewCommonUpgradeStateManager(log, k8sConfig, Scheme, eventRecorder)
+	commonmanager, err := NewCommonUpgradeStateManager(log, k8sConfig, Scheme, eventRecorder, opts.Scale)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create commonmanager upgrade state manager. %v", err)
 	}
@@ -91,8 +92,47 @@ func NewClusterUpgradeStateManager(
 	return manager, nil
 }
 
+// ScaleOptions controls performance-related parameters for large clusters.
+// Zero values use built-in defaults defined in consts.go.
+type ScaleOptions struct {
+	// MaxConcurrentNodeWorkers is the number of nodes processed concurrently during
+	// state transitions. Zero uses defaultMaxConcurrentNodeWorkers (32).
+	MaxConcurrentNodeWorkers int
+	// CacheSyncTimeout is the maximum time to wait for the operator cache to reflect
+	// a node label/annotation patch. Zero uses defaultCacheSyncTimeout (500ms).
+	CacheSyncTimeout time.Duration
+	// CacheSyncPollInterval is the interval between cache-sync check iterations.
+	// Zero uses cacheSyncPollInterval (100ms).
+	CacheSyncPollInterval time.Duration
+}
+
+// maxConcurrentWorkers returns the effective worker count, applying the default if zero.
+func (s ScaleOptions) maxConcurrentWorkers() int {
+	if s.MaxConcurrentNodeWorkers > 0 {
+		return s.MaxConcurrentNodeWorkers
+	}
+	return defaultMaxConcurrentNodeWorkers
+}
+
+// effectiveCacheSyncTimeout returns the effective cache-sync timeout, applying the default if zero.
+func (s ScaleOptions) effectiveCacheSyncTimeout() time.Duration {
+	if s.CacheSyncTimeout > 0 {
+		return s.CacheSyncTimeout
+	}
+	return time.Duration(defaultCacheSyncTimeout)
+}
+
+// effectiveCacheSyncPollInterval returns the effective poll interval, applying the default if zero.
+func (s ScaleOptions) effectiveCacheSyncPollInterval() time.Duration {
+	if s.CacheSyncPollInterval > 0 {
+		return s.CacheSyncPollInterval
+	}
+	return time.Duration(cacheSyncPollInterval)
+}
+
 type StateOptions struct {
 	Requestor RequestorOptions
+	Scale     ScaleOptions
 }
 
 // BuildState builds a point-in-time snapshot of the driver upgrade state in the cluster.
@@ -331,7 +371,7 @@ func (m *ClusterUpgradeStateManagerImpl) WithPodDeletionEnabled(filter PodDeleti
 		m.Log.V(consts.LogLevelWarning).Info("Cannot enable PodDeletion state as PodDeletionFilter is nil")
 		return m
 	}
-	m.PodManager = NewPodManager(m.K8sInterface, m.NodeUpgradeStateProvider, m.Log, filter, m.EventRecorder)
+	m.PodManager = NewPodManager(m.K8sInterface, m.NodeUpgradeStateProvider, m.Log, filter, m.EventRecorder, m.maxConcurrentWorkers)
 	m.podDeletionStateEnabled = true
 	return m
 }

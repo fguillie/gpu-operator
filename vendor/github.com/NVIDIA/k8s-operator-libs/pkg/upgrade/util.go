@@ -69,6 +69,13 @@ func (s *StringSet) Clear() {
 	s.m = make(map[string]bool)
 }
 
+// Len returns the number of items in the set
+func (s *StringSet) Len() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.m)
+}
+
 // KeyedMutex is a struct that provides a per-key synchronized access
 type KeyedMutex struct {
 	mutexes sync.Map // Zero value is empty and ready for use
@@ -152,6 +159,12 @@ func GetWaitForPodCompletionStartTimeAnnotationKey() string {
 // state
 func GetValidationStartTimeAnnotationKey() string {
 	return fmt.Sprintf(UpgradeValidationStartTimeAnnotationKeyFmt, DriverName)
+}
+
+// GetUpgradeNodeDeadlineAnnotationKey returns the annotation key used to track the Unix timestamp deadline
+// by which a node's full upgrade sequence must complete
+func GetUpgradeNodeDeadlineAnnotationKey() string {
+	return fmt.Sprintf(UpgradeNodeDeadlineAnnotationKeyFmt, DriverName)
 }
 
 // GetEventReason returns the reason type based on the driver name
